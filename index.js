@@ -248,6 +248,21 @@ app.get("/health", (req, res) => {
   });
 });
 
+// Debug auth endpoint — shows what secret the worker has vs what was sent
+app.get("/debug-auth", (req, res) => {
+  const received = req.headers.authorization?.replace("Bearer ", "") || "NONE";
+  const expected = process.env.WORKER_API_SECRET || "NOT SET";
+  res.json({
+    receivedLength: received.length,
+    receivedFirst4: received.slice(0, 4),
+    receivedLast4: received.slice(-4),
+    expectedLength: expected.length,
+    expectedFirst4: expected.slice(0, 4),
+    expectedLast4: expected.slice(-4),
+    match: received === expected,
+  });
+});
+
 // ─── Message Processing ─────────────────────────────────────────────
 
 async function handleIncomingMessage(userId, message) {
