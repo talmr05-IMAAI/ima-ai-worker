@@ -7,7 +7,7 @@
     "dev": "node --watch index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.16",
+    "@whiskeysockets/baileys": "6.6.0",
     "qrcode": "^1.5.4",
     "@prisma/client": "^6.2.0",
     "@anthropic-ai/sdk": "^0.39.0",

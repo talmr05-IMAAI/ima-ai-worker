@@ -12,6 +12,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   makeCacheableSignalKeyStore,
+  Browsers,
 } = require("@whiskeysockets/baileys");
 const QRCode = require("qrcode");
 const express = require("express");
@@ -77,7 +78,7 @@ async function startBaileysSession(userId) {
     },
     printQRInTerminal: false,
     logger,
-    browser: ["IMA AI", "Chrome", "1.0.0"],
+    browser: Browsers.ubuntu("Chrome"),
     // Reconnect settings
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: undefined,
