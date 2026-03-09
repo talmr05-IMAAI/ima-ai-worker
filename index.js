@@ -1,39 +1,47 @@
 /**
- * GroupCal WhatsApp Worker
+ * IMA AI WhatsApp Worker — Baileys Edition
  *
- * This is a long-running process that:
- * 1. Manages WhatsApp Web connections (one per user)
- * 2. Listens to group messages
- * 3. Sends them to AI for event detection
- * 4. Stores detected events in the database
+ * Uses @whiskeysockets/baileys (lightweight WebSocket-based WhatsApp client)
+ * instead of whatsapp-web.js (which requires Chromium/Puppeteer).
  *
- * Deploy this on Railway, Render, or any server that supports
- * long-running Node.js processes (NOT Vercel/serverless).
- *
- * The main Next.js app communicates with this worker through
- * the shared PostgreSQL database + a small Express API.
+ * Deploy on Railway, Render, or any Node.js host.
  */
 
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  makeCacheableSignalKeyStore,
+} = require("@whiskeysockets/baileys");
 const QRCode = require("qrcode");
 const express = require("express");
 const { PrismaClient } = require("@prisma/client");
 const Anthropic = require("@anthropic-ai/sdk").default;
+const fs = require("fs");
+const path = require("path");
+const pino = require("pino");
 
 const prisma = new PrismaClient();
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// Quiet logger for Baileys (it's very verbose by default)
+const logger = pino({ level: "warn" });
+
 // ─── In-memory store for active WhatsApp sessions ───────────────────
 
-/** @type {Map<string, { client: any, qrCode: string | null, status: string }>} */
+/** @type {Map<string, { socket: any, qrCode: string | null, status: string }>} */
 const sessions = new Map();
 
-// ─── Express API (so the Next.js app can talk to us) ────────────────
+// Directory to persist auth credentials
+const AUTH_DIR = path.join(process.cwd(), ".wa-auth");
+if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+// ─── Express API ────────────────────────────────────────────────────
 
 const app = express();
 app.use(express.json());
 
-// CORS for the Next.js frontend
+// CORS
 app.use((req, res, next) => {
   const allowedOrigin = process.env.FRONTEND_URL || "http://localhost:3000";
   res.header("Access-Control-Allow-Origin", allowedOrigin);
@@ -42,7 +50,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Simple auth middleware — the Next.js app sends a shared secret
+// Auth middleware
 function authMiddleware(req, res, next) {
   const token = req.headers.authorization?.replace("Bearer ", "");
   if (token !== process.env.WORKER_API_SECRET) {
@@ -51,9 +59,144 @@ function authMiddleware(req, res, next) {
   next();
 }
 
+// ─── Baileys Session Management ─────────────────────────────────────
+
+async function startBaileysSession(userId) {
+  const authDir = path.join(AUTH_DIR, userId);
+  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+  const sessionData = { socket: null, qrCode: null, status: "initializing" };
+  sessions.set(userId, sessionData);
+
+  const sock = makeWASocket({
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
+    printQRInTerminal: false,
+    logger,
+    browser: ["IMA AI", "Chrome", "1.0.0"],
+    // Reconnect settings
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: undefined,
+  });
+
+  sessionData.socket = sock;
+
+  // Save credentials whenever they update
+  sock.ev.on("creds.update", saveCreds);
+
+  // Connection state changes (QR code, open, close)
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log(`[${userId}] QR code generated`);
+      try {
+        const qrDataUrl = await QRCode.toDataURL(qr, { width: 300 });
+        sessionData.qrCode = qrDataUrl;
+        sessionData.status = "qr_ready";
+      } catch (err) {
+        console.error(`[${userId}] QR generation error:`, err.message);
+      }
+    }
+
+    if (connection === "open") {
+      console.log(`[${userId}] WhatsApp connected!`);
+      sessionData.status = "connected";
+      sessionData.qrCode = null;
+
+      // Fetch groups and store in database
+      try {
+        await syncGroups(userId, sock);
+      } catch (err) {
+        console.error(`[${userId}] Error syncing groups:`, err.message);
+      }
+    }
+
+    if (connection === "close") {
+      const statusCode =
+        lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+      console.log(
+        `[${userId}] Connection closed. Status: ${statusCode}. Reconnect: ${shouldReconnect}`
+      );
+
+      if (shouldReconnect) {
+        // Reconnect
+        sessionData.status = "reconnecting";
+        await startBaileysSession(userId);
+      } else {
+        // Logged out — clean up
+        sessionData.status = "disconnected";
+        sessions.delete(userId);
+        // Remove auth files so next connect shows QR
+        fs.rmSync(authDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  // Incoming messages
+  sock.ev.on("messages.upsert", async ({ messages: msgs, type }) => {
+    if (type !== "notify") return; // Only process new messages
+
+    for (const msg of msgs) {
+      if (!msg.message || msg.key.fromMe) continue;
+
+      try {
+        await handleIncomingMessage(userId, sock, msg);
+      } catch (err) {
+        console.error(`[${userId}] Error processing message:`, err.message);
+      }
+    }
+  });
+
+  return sessionData;
+}
+
+// ─── Group Sync ─────────────────────────────────────────────────────
+
+async function syncGroups(userId, sock) {
+  // Fetch all groups the user is part of
+  const groups = await sock.groupFetchAllParticipating();
+  const groupList = Object.values(groups);
+
+  console.log(`[${userId}] Found ${groupList.length} groups`);
+
+  for (const group of groupList) {
+    await prisma.whatsAppGroup.upsert({
+      where: { whatsappGroupId: group.id },
+      update: { name: group.subject },
+      create: {
+        whatsappGroupId: group.id,
+        name: group.subject,
+        description: group.desc || null,
+      },
+    });
+
+    const dbGroup = await prisma.whatsAppGroup.findUnique({
+      where: { whatsappGroupId: group.id },
+    });
+
+    if (dbGroup) {
+      await prisma.groupMembership.upsert({
+        where: {
+          userId_groupId: { userId, groupId: dbGroup.id },
+        },
+        update: { isActive: true },
+        create: { userId, groupId: dbGroup.id, isMonitored: false },
+      });
+    }
+  }
+}
+
+// ─── API Endpoints ──────────────────────────────────────────────────
+
 /**
- * POST /sessions/:userId/start
- * Start a new WhatsApp session for a user. Returns a QR code to scan.
+ * POST /sessions/:userId/start — Start a WhatsApp session
  */
 app.post("/sessions/:userId/start", authMiddleware, async (req, res) => {
   const { userId } = req.params;
@@ -67,113 +210,25 @@ app.post("/sessions/:userId/start", authMiddleware, async (req, res) => {
     if (session.status === "connected") {
       return res.json({ status: "connected" });
     }
+    if (session.status === "initializing") {
+      return res.json({ status: "initializing" });
+    }
   }
 
   console.log(`[${userId}] Starting new WhatsApp session...`);
 
   try {
-    const client = new Client({
-      authStrategy: new LocalAuth({ clientId: userId }),
-      puppeteer: {
-        headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-gpu",
-          "--single-process",
-        ],
-      },
-    });
-
-    const sessionData = { client, qrCode: null, status: "initializing" };
-    sessions.set(userId, sessionData);
-
-    // When QR code is generated
-    client.on("qr", async (qr) => {
-      console.log(`[${userId}] QR code generated`);
-      const qrDataUrl = await QRCode.toDataURL(qr, { width: 300 });
-      sessionData.qrCode = qrDataUrl;
-      sessionData.status = "qr_ready";
-    });
-
-    // When successfully connected
-    client.on("ready", async () => {
-      console.log(`[${userId}] WhatsApp connected!`);
-      sessionData.status = "connected";
-      sessionData.qrCode = null;
-
-      // Get all groups this user is in
-      const chats = await client.getChats();
-      const groups = chats.filter((c) => c.isGroup);
-
-      console.log(`[${userId}] Found ${groups.length} groups`);
-
-      // Store groups in database (but do NOT enable monitoring by default)
-      // Users must explicitly choose which groups to monitor on the dashboard
-      for (const group of groups) {
-        await prisma.whatsAppGroup.upsert({
-          where: { whatsappGroupId: group.id._serialized },
-          update: { name: group.name },
-          create: {
-            whatsappGroupId: group.id._serialized,
-            name: group.name,
-            description: group.description || null,
-          },
-        });
-
-        const dbGroup = await prisma.whatsAppGroup.findUnique({
-          where: { whatsappGroupId: group.id._serialized },
-        });
-
-        if (dbGroup) {
-          await prisma.groupMembership.upsert({
-            where: {
-              userId_groupId: { userId, groupId: dbGroup.id },
-            },
-            update: { isActive: true },
-            // isMonitored defaults to false — user picks groups on dashboard
-            create: { userId, groupId: dbGroup.id, isMonitored: false },
-          });
-        }
-      }
-    });
-
-    // When a message is received
-    client.on("message", async (message) => {
-      try {
-        await handleIncomingMessage(userId, message);
-      } catch (err) {
-        console.error(`[${userId}] Error processing message:`, err.message);
-      }
-    });
-
-    // When disconnected
-    client.on("disconnected", (reason) => {
-      console.log(`[${userId}] Disconnected:`, reason);
-      sessionData.status = "disconnected";
-      sessions.delete(userId);
-    });
-
-    // Authentication failure
-    client.on("auth_failure", (msg) => {
-      console.error(`[${userId}] Auth failure:`, msg);
-      sessionData.status = "auth_failed";
-    });
-
-    await client.initialize();
-
-    res.json({ status: "initializing" });
+    const sessionData = await startBaileysSession(userId);
+    res.json({ status: sessionData.status });
   } catch (err) {
     console.error(`[${userId}] Failed to start session:`, err.message);
     sessions.delete(userId);
-    res.status(500).json({ error: "Failed to start WhatsApp session" });
+    res.status(500).json({ error: "Failed to start WhatsApp session", detail: err.message });
   }
 });
 
 /**
- * GET /sessions/:userId/status
- * Check the status of a user's WhatsApp session.
+ * GET /sessions/:userId/status — Check session status
  */
 app.get("/sessions/:userId/status", authMiddleware, (req, res) => {
   const { userId } = req.params;
@@ -192,8 +247,7 @@ app.get("/sessions/:userId/status", authMiddleware, (req, res) => {
 });
 
 /**
- * GET /sessions/:userId/groups
- * Get list of WhatsApp groups for a connected user.
+ * GET /sessions/:userId/groups — Get groups for connected user
  */
 app.get("/sessions/:userId/groups", authMiddleware, async (req, res) => {
   const { userId } = req.params;
@@ -204,31 +258,28 @@ app.get("/sessions/:userId/groups", authMiddleware, async (req, res) => {
   }
 
   try {
-    const chats = await session.client.getChats();
-    const groups = chats
-      .filter((c) => c.isGroup)
-      .map((g) => ({
-        id: g.id._serialized,
-        name: g.name,
-        participantCount: g.participants?.length || 0,
-      }));
-    res.json({ groups });
+    const groups = await session.socket.groupFetchAllParticipating();
+    const groupList = Object.values(groups).map((g) => ({
+      id: g.id,
+      name: g.subject,
+      participantCount: g.participants?.length || 0,
+    }));
+    res.json({ groups: groupList });
   } catch (err) {
     res.status(500).json({ error: "Failed to get groups" });
   }
 });
 
 /**
- * DELETE /sessions/:userId
- * Disconnect and remove a user's WhatsApp session.
+ * DELETE /sessions/:userId — Disconnect session
  */
 app.delete("/sessions/:userId", authMiddleware, async (req, res) => {
   const { userId } = req.params;
   const session = sessions.get(userId);
 
-  if (session) {
+  if (session && session.socket) {
     try {
-      await session.client.destroy();
+      await session.socket.logout();
     } catch {}
     sessions.delete(userId);
   }
@@ -237,67 +288,67 @@ app.delete("/sessions/:userId", authMiddleware, async (req, res) => {
 });
 
 /**
- * GET /health
- * Health check endpoint.
+ * GET /health — Health check
  */
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     activeSessions: sessions.size,
     uptime: process.uptime(),
+    engine: "baileys",
   });
 });
 
 // ─── Message Processing ─────────────────────────────────────────────
 
-async function handleIncomingMessage(userId, message) {
+async function handleIncomingMessage(userId, sock, msg) {
+  const jid = msg.key.remoteJid;
+
   // Only process group messages
-  const chat = await message.getChat();
-  if (!chat.isGroup) return;
+  if (!jid || !jid.endsWith("@g.us")) return;
 
-  const groupId = chat.id._serialized;
+  const groupId = jid;
 
-  // ─── PRIVACY CHECK: Only process groups the user opted into ───
+  // Privacy check: only process monitored groups
   const dbGroup = await prisma.whatsAppGroup.findUnique({
     where: { whatsappGroupId: groupId },
   });
 
-  if (!dbGroup) {
-    // Group exists in WhatsApp but not in our DB yet — skip it.
-    // It will be added to DB (without monitoring) when the user
-    // opens the group picker on the dashboard.
-    return;
-  }
+  if (!dbGroup) return;
 
-  // Check if ANY member has opted in to monitoring this group
   const monitoringMembers = await prisma.groupMembership.findMany({
     where: { groupId: dbGroup.id, isActive: true, isMonitored: true },
   });
 
-  if (monitoringMembers.length === 0) {
-    // Nobody is monitoring this group — skip entirely.
-    // No message is stored, no AI is called, nothing happens.
-    return;
-  }
+  if (monitoringMembers.length === 0) return;
 
-  const contact = await message.getContact();
+  // Extract message text
+  const messageText =
+    msg.message?.conversation ||
+    msg.message?.extendedTextMessage?.text ||
+    "";
 
-  // Store message (only for monitored groups)
+  if (!messageText || messageText.length < 10) return;
+
+  // Get sender info
+  const senderJid = msg.key.participant || msg.key.remoteJid;
+  const senderPhone = senderJid.split("@")[0];
+  const senderName = msg.pushName || senderPhone;
+
+  // Store message
+  const msgId = msg.key.id || `${Date.now()}-${Math.random()}`;
   const storedMessage = await prisma.whatsAppMessage.upsert({
-    where: { waMessageId: message.id._serialized },
+    where: { waMessageId: msgId },
     update: {},
     create: {
-      waMessageId: message.id._serialized,
+      waMessageId: msgId,
       groupId: dbGroup.id,
-      senderPhone: contact.number || "unknown",
-      senderName: contact.pushname || contact.name || "Unknown",
-      content: message.body || "",
-      timestamp: new Date(message.timestamp * 1000),
+      senderPhone,
+      senderName,
+      content: messageText,
+      timestamp: new Date((msg.messageTimestamp || Date.now() / 1000) * 1000),
     },
   });
-
-  // Skip if empty or very short
-  if (!message.body || message.body.length < 10) return;
 
   // Get recent messages for context
   const recentMessages = await prisma.whatsAppMessage.findMany({
@@ -307,7 +358,11 @@ async function handleIncomingMessage(userId, message) {
   });
 
   // Run AI parsing
-  const events = await parseWithAI(recentMessages.reverse(), chat.name, storedMessage.id);
+  const events = await parseWithAI(
+    recentMessages.reverse(),
+    dbGroup.name,
+    storedMessage.id
+  );
 
   if (events.length === 0) {
     await prisma.whatsAppMessage.update({
@@ -317,12 +372,11 @@ async function handleIncomingMessage(userId, message) {
     return;
   }
 
-  // Find only users who opted in to monitoring this group
+  // Create events for each monitoring member
   const members = await prisma.groupMembership.findMany({
     where: { groupId: dbGroup.id, isActive: true, isMonitored: true },
   });
 
-  // Create events for each member
   for (const event of events) {
     for (const member of members) {
       await prisma.detectedEvent.create({
@@ -344,7 +398,7 @@ async function handleIncomingMessage(userId, message) {
   }
 
   console.log(
-    `[${userId}] Detected ${events.length} event(s) in "${chat.name}"`
+    `[${userId}] Detected ${events.length} event(s) in "${dbGroup.name}"`
   );
 
   await prisma.whatsAppMessage.update({
@@ -428,8 +482,9 @@ Return ONLY a JSON array (or [] if nothing found):
 
 const PORT = process.env.PORT || 3001;
 
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`IMA AI Worker running on port ${PORT}`);
+  console.log(`Engine: Baileys (no Chromium needed)`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
 });
 
@@ -438,7 +493,7 @@ process.on("SIGTERM", async () => {
   console.log("Shutting down...");
   for (const [userId, session] of sessions) {
     try {
-      await session.client.destroy();
+      if (session.socket) await session.socket.end();
     } catch {}
   }
   await prisma.$disconnect();
