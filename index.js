@@ -22,8 +22,13 @@ const fs = require("fs");
 const path = require("path");
 const pino = require("pino");
 
+const { google } = require("googleapis");
+
 const prisma = new PrismaClient();
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// Store Google OAuth tokens per user (userId -> { email, accessToken, refreshToken })
+const userTokens = new Map();
 
 // Quiet logger for Baileys (it's very verbose by default)
 const logger = pino({ level: "warn" });
@@ -244,7 +249,17 @@ async function syncGroups(userId, sock) {
  */
 app.post("/sessions/:userId/start", authMiddleware, async (req, res) => {
   const { userId } = req.params;
-  const { email, name, image } = req.body || {};
+  const { email, name, image, googleAccessToken, googleRefreshToken } = req.body || {};
+
+  // Store Google OAuth tokens for auto calendar invites
+  if (googleAccessToken) {
+    userTokens.set(userId, {
+      email: email || null,
+      accessToken: googleAccessToken,
+      refreshToken: googleRefreshToken || null,
+    });
+    console.log(`[${userId}] Stored Google OAuth tokens for auto calendar invites (email: ${email})`);
+  }
 
   // Ensure user exists in database using raw SQL (most reliable)
   let dbUserId = userId;
@@ -524,13 +539,16 @@ async function handleIncomingMessage(userId, sock, msg) {
     return;
   }
 
-  // Create events for each monitoring member
+  // Create events for each monitoring member and auto-send calendar invites
   const members = await prisma.groupMembership.findMany({
     where: { groupId: dbGroup.id, isActive: true, isMonitored: true },
   });
 
   for (const event of events) {
     for (const member of members) {
+      // Auto-send calendar invite
+      const calendarId = await sendCalendarInvite(member.userId, event, dbGroup.name);
+
       await prisma.detectedEvent.create({
         data: {
           userId: member.userId,
@@ -543,20 +561,109 @@ async function handleIncomingMessage(userId, sock, msg) {
           location: event.location || null,
           eventType: event.eventType,
           confidence: event.confidence,
-          status: event.confidence >= 0.7 ? "PENDING" : "PENDING",
+          status: calendarId ? "SYNCED" : "PENDING",
+          calendarId: calendarId || null,
         },
       });
     }
   }
 
   console.log(
-    `[${userId}] Detected ${events.length} event(s) in "${dbGroup.name}"`
+    `[${userId}] Detected ${events.length} event(s) in "${dbGroup.name}" — calendar invites sent automatically`
   );
 
   await prisma.whatsAppMessage.update({
     where: { id: storedMessage.id },
     data: { processed: true },
   });
+}
+
+// ─── Google Calendar Auto-Invite ─────────────────────────────────────
+
+const EVENT_EMOJIS = {
+  SCHOOL_EVENT: "🏫", DEADLINE: "⏰", BRING_ITEM: "🎒", MEETING: "🤝",
+  TRIP: "🚌", PAYMENT: "💰", REMINDER: "📌", OTHER: "📋",
+};
+
+const EVENT_COLORS = {
+  SCHOOL_EVENT: "9", DEADLINE: "11", BRING_ITEM: "5", MEETING: "7",
+  TRIP: "2", PAYMENT: "6", REMINDER: "8", OTHER: "8",
+};
+
+async function sendCalendarInvite(userId, event, groupName) {
+  const tokens = userTokens.get(userId);
+  if (!tokens || !tokens.accessToken) {
+    console.log(`[${userId}] No Google tokens stored, skipping calendar invite`);
+    return null;
+  }
+
+  try {
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET
+    );
+
+    oauth2Client.setCredentials({
+      access_token: tokens.accessToken,
+      refresh_token: tokens.refreshToken || undefined,
+    });
+
+    // Try to refresh token if we have a refresh token
+    if (tokens.refreshToken) {
+      try {
+        const { credentials } = await oauth2Client.refreshAccessToken();
+        tokens.accessToken = credentials.access_token;
+        userTokens.set(userId, tokens);
+      } catch (refreshErr) {
+        console.warn(`[${userId}] Token refresh failed, using existing:`, refreshErr.message);
+      }
+    }
+
+    const calendar = google.calendar({ version: "v3", auth: oauth2Client });
+
+    const emoji = EVENT_EMOJIS[event.eventType] || "📋";
+    const endTime = event.endTime
+      ? new Date(event.endTime)
+      : new Date(new Date(event.startTime).getTime() + 60 * 60 * 1000);
+
+    const res = await calendar.events.insert({
+      calendarId: "primary",
+      sendUpdates: "all",
+      requestBody: {
+        summary: `${emoji} ${event.title}`,
+        description: [
+          event.description || "",
+          "",
+          `📱 Detected by IMA AI from "${groupName}"`,
+          `🎯 Confidence: ${Math.round(event.confidence * 100)}%`,
+        ].join("\n"),
+        start: {
+          dateTime: new Date(event.startTime).toISOString(),
+          timeZone: "Asia/Jerusalem",
+        },
+        end: {
+          dateTime: endTime.toISOString(),
+          timeZone: "Asia/Jerusalem",
+        },
+        location: event.location || undefined,
+        attendees: tokens.email ? [{ email: tokens.email, responseStatus: "needsAction" }] : undefined,
+        reminders: {
+          useDefault: false,
+          overrides: [
+            { method: "email", minutes: 1440 },
+            { method: "popup", minutes: 60 },
+          ],
+        },
+        colorId: EVENT_COLORS[event.eventType] || "8",
+      },
+    });
+
+    console.log(`[${userId}] Calendar invite sent: "${event.title}" (id: ${res.data.id})`);
+    return res.data.id;
+  } catch (err) {
+    console.error(`[${userId}] Calendar invite failed:`, err.message);
+    return null;
+  }
 }
 
 // ─── AI Parsing ─────────────────────────────────────────────────────
