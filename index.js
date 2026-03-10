@@ -251,37 +251,6 @@ app.post("/sessions/:userId/start", authMiddleware, async (req, res) => {
   const { userId } = req.params;
   const { email, name, image, googleAccessToken, googleRefreshToken } = req.body || {};
 
-  // Store Google OAuth tokens in DB (CalendarLink) so they survive restarts
-  if (googleAccessToken) {
-    try {
-      await prisma.$executeRawUnsafe(
-        `INSERT INTO "CalendarLink" (id, "userId", provider, "accessToken", "refreshToken", "isActive", "createdAt", "updatedAt")
-         VALUES (gen_random_uuid()::text, $1, 'GOOGLE', $2, $3, true, NOW(), NOW())
-         ON CONFLICT ("userId", provider) DO UPDATE SET
-           "accessToken" = $2,
-           "refreshToken" = COALESCE($3, "CalendarLink"."refreshToken"),
-           "isActive" = true,
-           "updatedAt" = NOW()`,
-        dbUserId, googleAccessToken, googleRefreshToken || null
-      );
-      // Also cache in memory for fast access
-      userTokens.set(dbUserId, {
-        email: email || null,
-        accessToken: googleAccessToken,
-        refreshToken: googleRefreshToken || null,
-      });
-      console.log(`[${userId}] Stored Google OAuth tokens in DB + memory (email: ${email})`);
-    } catch (tokenErr) {
-      console.error(`[${userId}] Failed to store Google tokens:`, tokenErr.message);
-      // Still cache in memory as fallback
-      userTokens.set(dbUserId, {
-        email: email || null,
-        accessToken: googleAccessToken,
-        refreshToken: googleRefreshToken || null,
-      });
-    }
-  }
-
   // Ensure user exists in database using raw SQL (most reliable)
   let dbUserId = userId;
   try {
@@ -324,6 +293,35 @@ app.post("/sessions/:userId/start", authMiddleware, async (req, res) => {
           console.error(`[${userId}] Email lookup also failed:`, lookupErr.message);
         }
       }
+    }
+  }
+
+  // Store Google OAuth tokens in DB (CalendarLink) so they survive restarts
+  if (googleAccessToken) {
+    try {
+      await prisma.$executeRawUnsafe(
+        `INSERT INTO "CalendarLink" (id, "userId", provider, "accessToken", "refreshToken", "isActive", "createdAt", "updatedAt")
+         VALUES (gen_random_uuid()::text, $1, 'GOOGLE', $2, $3, true, NOW(), NOW())
+         ON CONFLICT ("userId", provider) DO UPDATE SET
+           "accessToken" = $2,
+           "refreshToken" = COALESCE($3, "CalendarLink"."refreshToken"),
+           "isActive" = true,
+           "updatedAt" = NOW()`,
+        dbUserId, googleAccessToken, googleRefreshToken || null
+      );
+      userTokens.set(dbUserId, {
+        email: email || null,
+        accessToken: googleAccessToken,
+        refreshToken: googleRefreshToken || null,
+      });
+      console.log(`[${userId}] Stored Google OAuth tokens in DB + memory (email: ${email})`);
+    } catch (tokenErr) {
+      console.error(`[${userId}] Failed to store Google tokens:`, tokenErr.message);
+      userTokens.set(dbUserId, {
+        email: email || null,
+        accessToken: googleAccessToken,
+        refreshToken: googleRefreshToken || null,
+      });
     }
   }
 
