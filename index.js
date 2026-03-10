@@ -750,27 +750,52 @@ Rules:
 - If year not mentioned, assume nearest future date
 - Confidence 0.0-1.0 reflects certainty
 
-Return ONLY a JSON array (or [] if nothing found):
-[{
-  "title": "Short title",
-  "description": "Context from message",
-  "startTime": "ISO 8601",
-  "endTime": "ISO 8601 or null",
-  "location": "or null",
-  "eventType": "SCHOOL_EVENT|DEADLINE|BRING_ITEM|MEETING|TRIP|PAYMENT|REMINDER|OTHER",
-  "confidence": 0.0-1.0,
-  "sourceMessageIndex": <int>
-}]`,
+IMPORTANT: Return ONLY valid JSON. No markdown, no code fences, no explanation. Just the raw JSON array.
+
+If no events found, return exactly: []
+
+Otherwise return:
+[{"title": "Short title", "description": "Context from message", "startTime": "ISO 8601", "endTime": "ISO 8601 or null", "location": "or null", "eventType": "SCHOOL_EVENT|DEADLINE|BRING_ITEM|MEETING|TRIP|PAYMENT|REMINDER|OTHER", "confidence": 0.9, "sourceMessageIndex": 0}]`,
         },
       ],
     });
 
     const text =
       response.content[0].type === "text" ? response.content[0].text : "";
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) return [];
+    console.log("AI raw response:", text.slice(0, 500));
 
-    const events = JSON.parse(jsonMatch[0]);
+    // Try to extract JSON array - handle cases where AI adds extra text
+    const jsonMatch = text.match(/\[[\s\S]*?\](?=\s*$|\s*[^,\]\}\w])/);
+    let events;
+    if (jsonMatch) {
+      try {
+        events = JSON.parse(jsonMatch[0]);
+      } catch (parseErr) {
+        // If first regex failed, try finding balanced brackets
+        const start = text.indexOf('[');
+        const end = text.lastIndexOf(']');
+        if (start !== -1 && end > start) {
+          const jsonStr = text.slice(start, end + 1);
+          try {
+            events = JSON.parse(jsonStr);
+          } catch (e2) {
+            // Try removing trailing commas (common AI mistake)
+            const cleaned = jsonStr.replace(/,\s*([}\]])/g, '$1');
+            events = JSON.parse(cleaned);
+          }
+        }
+      }
+    } else {
+      // Fallback: find first [ and last ]
+      const start = text.indexOf('[');
+      const end = text.lastIndexOf(']');
+      if (start === -1 || end <= start) return [];
+      const jsonStr = text.slice(start, end + 1);
+      const cleaned = jsonStr.replace(/,\s*([}\]])/g, '$1');
+      events = JSON.parse(cleaned);
+    }
+
+    if (!Array.isArray(events)) return [];
     return events.filter(
       (e) =>
         e.title &&
