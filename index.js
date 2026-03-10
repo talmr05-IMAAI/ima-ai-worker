@@ -796,7 +796,7 @@ if (fs.existsSync(AUTH_DIR)) {
 }
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`IMA AI Worker v2.1 running on port ${PORT}`);
+  console.log(`IMA AI Worker v2.2 running on port ${PORT}`);
   console.log(`Engine: Baileys | Auto-calendar: enabled`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
 });
