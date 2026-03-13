@@ -877,6 +877,14 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
 });
 
+// Keep process alive — catch unhandled errors
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception (keeping alive):", err.message);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection (keeping alive):", reason);
+});
+
 // Graceful shutdown
 process.on("SIGTERM", async () => {
   console.log("Shutting down...");
