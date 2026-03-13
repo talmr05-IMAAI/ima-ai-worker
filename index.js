@@ -719,8 +719,7 @@ async function sendCalendarInvite(userId, event, groupName) {
         reminders: {
           useDefault: false,
           overrides: [
-            { method: "email", minutes: 1440 },
-            { method: "popup", minutes: 60 },
+            { method: "popup", minutes: 30 },
           ],
         },
         colorId: EVENT_COLORS[event.eventType] || "8",
@@ -772,7 +771,7 @@ Look for: school events, deadlines, items to bring, meetings, trips, payments, a
 Rules:
 - Only extract items with clear dates/times
 - Skip casual chat ("thanks", "good morning", etc.)
-- For "bring X" items, set reminder for the day BEFORE
+- For "bring X" items, set the event at the actual date/time mentioned (NOT the day before)
 - If year not mentioned, assume nearest future date
 - Confidence 0.0-1.0 reflects certainty
 
