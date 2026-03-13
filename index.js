@@ -697,7 +697,6 @@ async function sendCalendarInvite(userId, event, groupName) {
 
     const res = await calendar.events.insert({
       calendarId: "primary",
-      sendUpdates: "all",
       requestBody: {
         summary: `${emoji} ${event.title}`,
         description: [
@@ -715,7 +714,8 @@ async function sendCalendarInvite(userId, event, groupName) {
           timeZone: "Asia/Jerusalem",
         },
         location: event.location || undefined,
-        attendees: tokens.email ? [{ email: tokens.email }] : undefined,
+        // No attendees — event is created directly on user's primary calendar
+        // and will sync naturally to Apple Calendar, Outlook, etc.
         reminders: {
           useDefault: false,
           overrides: [
@@ -847,7 +847,7 @@ if (fs.existsSync(AUTH_DIR)) {
 }
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`IMA AI Worker v2.4 running on port ${PORT}`);
+  console.log(`IMA AI Worker v2.5 running on port ${PORT}`);
   console.log(`Engine: Baileys | Auto-calendar: enabled`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
 });
