@@ -468,7 +468,10 @@ app.get("/debug-db/:userId", async (req, res) => {
   res.json(results);
 });
 
-// ─── Message Processing ─────────────────────────────────────────────
+// ─── Message Processing (Batched) ────────────────────────────────────
+
+// Track which groups have pending unprocessed messages
+const pendingGroups = new Set();
 
 async function handleIncomingMessage(userId, sock, msg) {
   const jid = msg.key.remoteJid;
@@ -483,21 +486,13 @@ async function handleIncomingMessage(userId, sock, msg) {
     where: { whatsappGroupId: groupId },
   });
 
-  if (!dbGroup) {
-    console.log(`[${userId}] Group ${groupId} not found in DB, skipping`);
-    return;
-  }
+  if (!dbGroup) return;
 
   const monitoringMembers = await prisma.groupMembership.findMany({
     where: { groupId: dbGroup.id, isActive: true, isMonitored: true },
   });
 
-  if (monitoringMembers.length === 0) {
-    // Silently skip groups that aren't being monitored
-    return;
-  }
-
-  console.log(`[${userId}] Group "${dbGroup.name}": ${monitoringMembers.length} monitoring members`);
+  if (monitoringMembers.length === 0) return;
 
   // Extract message text
   const messageText =
@@ -505,22 +500,18 @@ async function handleIncomingMessage(userId, sock, msg) {
     msg.message?.extendedTextMessage?.text ||
     "";
 
-  if (!messageText || messageText.length < 10) {
-    console.log(`[${userId}] Message too short (${messageText.length} chars), skipping`);
-    return;
-  }
+  if (!messageText || messageText.length < 10) return;
 
-  console.log(`[${userId}] Processing message in "${dbGroup.name}": "${messageText.slice(0, 100)}"`);
-
+  console.log(`[${userId}] Queued message in "${dbGroup.name}": "${messageText.slice(0, 80)}"`);
 
   // Get sender info
   const senderJid = msg.key.participant || msg.key.remoteJid;
   const senderPhone = senderJid.split("@")[0];
   const senderName = msg.pushName || senderPhone;
 
-  // Store message
+  // Store message (unprocessed)
   const msgId = msg.key.id || `${Date.now()}-${Math.random()}`;
-  const storedMessage = await prisma.whatsAppMessage.upsert({
+  await prisma.whatsAppMessage.upsert({
     where: { waMessageId: msgId },
     update: {},
     create: {
@@ -533,46 +524,84 @@ async function handleIncomingMessage(userId, sock, msg) {
     },
   });
 
-  // Get recent messages for context
-  const recentMessages = await prisma.whatsAppMessage.findMany({
-    where: { groupId: dbGroup.id },
+  // Mark this group as having pending messages
+  pendingGroups.add(dbGroup.id);
+}
+
+// Process all pending groups in a batch every 5 minutes
+const BATCH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function processPendingGroups() {
+  if (pendingGroups.size === 0) return;
+
+  const groupIds = [...pendingGroups];
+  pendingGroups.clear();
+
+  console.log(`[Batch] Processing ${groupIds.length} group(s) with new messages...`);
+
+  for (const groupId of groupIds) {
+    try {
+      await processGroupBatch(groupId);
+    } catch (err) {
+      console.error(`[Batch] Error processing group ${groupId}:`, err.message);
+    }
+  }
+}
+
+async function processGroupBatch(groupId) {
+  // Get unprocessed messages
+  const unprocessed = await prisma.whatsAppMessage.findMany({
+    where: { groupId, processed: false },
     orderBy: { timestamp: "desc" },
-    take: 15,
+    take: 30,
   });
 
-  // Run AI parsing
-  console.log(`[${userId}] Running AI parsing on ${recentMessages.length} messages from "${dbGroup.name}"...`);
+  if (unprocessed.length === 0) return;
+
+  const dbGroup = await prisma.whatsAppGroup.findUnique({ where: { id: groupId } });
+  if (!dbGroup) return;
+
+  const members = await prisma.groupMembership.findMany({
+    where: { groupId, isActive: true, isMonitored: true },
+  });
+
+  if (members.length === 0) return;
+
+  // Get recent messages for AI context (including already processed for context)
+  const recentMessages = await prisma.whatsAppMessage.findMany({
+    where: { groupId },
+    orderBy: { timestamp: "desc" },
+    take: 20,
+  });
+
+  console.log(`[Batch] Group "${dbGroup.name}": ${unprocessed.length} new msgs, running AI on ${recentMessages.length} for context...`);
+
   const events = await parseWithAI(
     recentMessages.reverse(),
     dbGroup.name,
-    storedMessage.id
+    unprocessed[0].id
   );
 
-  console.log(`[${userId}] AI detected ${events.length} event(s) in "${dbGroup.name}"`);
+  console.log(`[Batch] AI detected ${events.length} event(s) in "${dbGroup.name}"`);
 
-  if (events.length === 0) {
-    await prisma.whatsAppMessage.update({
-      where: { id: storedMessage.id },
-      data: { processed: true },
-    });
-    return;
-  }
-
-  // Create events for each monitoring member and auto-send calendar invites
-  const members = await prisma.groupMembership.findMany({
-    where: { groupId: dbGroup.id, isActive: true, isMonitored: true },
+  // Mark all unprocessed as processed
+  await prisma.whatsAppMessage.updateMany({
+    where: { id: { in: unprocessed.map((m) => m.id) } },
+    data: { processed: true },
   });
 
+  if (events.length === 0) return;
+
+  // Create events and send calendar invites for each member
   for (const event of events) {
     for (const member of members) {
-      // Auto-send calendar invite
       const calendarId = await sendCalendarInvite(member.userId, event, dbGroup.name);
 
       await prisma.detectedEvent.create({
         data: {
           userId: member.userId,
-          groupId: dbGroup.id,
-          messageId: storedMessage.id,
+          groupId,
+          messageId: unprocessed[0].id,
           title: event.title,
           description: event.description,
           startTime: new Date(event.startTime),
@@ -587,15 +616,12 @@ async function handleIncomingMessage(userId, sock, msg) {
     }
   }
 
-  console.log(
-    `[${userId}] Detected ${events.length} event(s) in "${dbGroup.name}" — calendar invites sent automatically`
-  );
-
-  await prisma.whatsAppMessage.update({
-    where: { id: storedMessage.id },
-    data: { processed: true },
-  });
+  console.log(`[Batch] Created ${events.length} event(s) in "${dbGroup.name}" for ${members.length} member(s)`);
 }
+
+// Start batch processing timer
+setInterval(processPendingGroups, BATCH_INTERVAL_MS);
+console.log(`Batch processing enabled: every ${BATCH_INTERVAL_MS / 1000}s`);
 
 // ─── Google Calendar Auto-Invite ─────────────────────────────────────
 
@@ -752,7 +778,7 @@ async function parseWithAI(messages, groupName, currentMessageId) {
 
   try {
     const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-6",
+      model: "claude-haiku-4-5-20251001",
       max_tokens: 2000,
       messages: [
         {
@@ -846,7 +872,7 @@ if (fs.existsSync(AUTH_DIR)) {
 }
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`IMA AI Worker v2.5 running on port ${PORT}`);
+  console.log(`IMA AI Worker v3.0 running on port ${PORT}`);
   console.log(`Engine: Baileys | Auto-calendar: enabled`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
 });
