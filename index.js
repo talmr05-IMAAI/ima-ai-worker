@@ -524,8 +524,9 @@ async function handleIncomingMessage(userId, sock, msg) {
     },
   });
 
-  // Mark this group as having pending messages
-  pendingGroups.add(dbGroup.id);
+  // Process immediately (switch back to batched for production)
+  console.log(`[Immediate] Processing group ${dbGroup.id} now...`);
+  await processGroupBatch(dbGroup.id);
 }
 
 // Process all pending groups in a batch every 5 minutes
