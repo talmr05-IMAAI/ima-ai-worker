@@ -596,6 +596,62 @@ async function processGroupBatch(groupId) {
   // Create events and send calendar invites for each member
   for (const event of events) {
     for (const member of members) {
+      // Handle event updates — find and update the original calendar event
+      if (event.isUpdate && event.originalTitle) {
+        const existingEvent = await prisma.detectedEvent.findFirst({
+          where: {
+            userId: member.userId,
+            groupId,
+            title: { contains: event.originalTitle.replace(/^[\p{Emoji}\s]+/u, '').trim() },
+            status: { in: ["SYNCED", "PENDING"] },
+          },
+          orderBy: { createdAt: "desc" },
+        });
+
+        if (existingEvent && existingEvent.calendarId) {
+          console.log(`[Batch] Updating existing event "${existingEvent.title}" -> "${event.title}" for user ${member.userId}`);
+          const updatedCalId = await updateCalendarEvent(member.userId, existingEvent.calendarId, event, dbGroup.name);
+          await prisma.detectedEvent.update({
+            where: { id: existingEvent.id },
+            data: {
+              title: event.title,
+              description: event.description,
+              startTime: new Date(event.startTime),
+              endTime: event.endTime ? new Date(event.endTime) : null,
+              location: event.location || null,
+              status: updatedCalId ? "SYNCED" : "PENDING",
+            },
+          });
+          continue;
+        }
+      }
+
+      // Handle cancellations — delete the original calendar event
+      if (event.isCancelled && event.originalTitle) {
+        const existingEvent = await prisma.detectedEvent.findFirst({
+          where: {
+            userId: member.userId,
+            groupId,
+            title: { contains: event.originalTitle.replace(/^[\p{Emoji}\s]+/u, '').trim() },
+            status: { in: ["SYNCED", "PENDING"] },
+          },
+          orderBy: { createdAt: "desc" },
+        });
+
+        if (existingEvent) {
+          console.log(`[Batch] Cancelling event "${existingEvent.title}" for user ${member.userId}`);
+          if (existingEvent.calendarId) {
+            await deleteCalendarEvent(member.userId, existingEvent.calendarId);
+          }
+          await prisma.detectedEvent.update({
+            where: { id: existingEvent.id },
+            data: { status: "DISMISSED" },
+          });
+          continue;
+        }
+      }
+
+      // Normal new event
       const calendarId = await sendCalendarInvite(member.userId, event, dbGroup.name);
 
       await prisma.detectedEvent.create({
@@ -617,7 +673,7 @@ async function processGroupBatch(groupId) {
     }
   }
 
-  console.log(`[Batch] Created ${events.length} event(s) in "${dbGroup.name}" for ${members.length} member(s)`);
+  console.log(`[Batch] Processed ${events.length} event(s) in "${dbGroup.name}" for ${members.length} member(s)`);
 }
 
 // Start batch processing timer
@@ -765,6 +821,85 @@ async function sendCalendarInvite(userId, event, groupName) {
   }
 }
 
+// ─── Google Calendar Update & Delete ─────────────────────────────────
+
+async function getOAuth2Client(userId) {
+  let tokens = userTokens.get(userId);
+  if (!tokens || !tokens.accessToken) return null;
+
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET
+  );
+
+  if (tokens.refreshToken) {
+    try {
+      oauth2Client.setCredentials({ refresh_token: tokens.refreshToken });
+      const { credentials } = await oauth2Client.refreshAccessToken();
+      tokens.accessToken = credentials.access_token;
+      if (credentials.refresh_token) tokens.refreshToken = credentials.refresh_token;
+      userTokens.set(userId, tokens);
+    } catch {
+      oauth2Client.setCredentials({ access_token: tokens.accessToken, refresh_token: tokens.refreshToken });
+    }
+  } else {
+    oauth2Client.setCredentials({ access_token: tokens.accessToken });
+  }
+
+  return oauth2Client;
+}
+
+async function updateCalendarEvent(userId, calendarEventId, event, groupName) {
+  try {
+    const oauth2Client = await getOAuth2Client(userId);
+    if (!oauth2Client) return null;
+
+    const calendar = google.calendar({ version: "v3", auth: oauth2Client });
+    const emoji = EVENT_EMOJIS[event.eventType] || "📋";
+    const endTime = event.endTime
+      ? new Date(event.endTime)
+      : new Date(new Date(event.startTime).getTime() + 60 * 60 * 1000);
+
+    const res = await calendar.events.update({
+      calendarId: "primary",
+      eventId: calendarEventId,
+      requestBody: {
+        summary: `${emoji} ${event.title}`,
+        description: [
+          event.description || "",
+          "",
+          `📱 Updated by IMA AI from "${groupName}"`,
+          `🎯 Confidence: ${Math.round(event.confidence * 100)}%`,
+        ].join("\n"),
+        start: { dateTime: new Date(event.startTime).toISOString(), timeZone: "Asia/Jerusalem" },
+        end: { dateTime: endTime.toISOString(), timeZone: "Asia/Jerusalem" },
+        location: event.location || undefined,
+        reminders: { useDefault: false, overrides: [{ method: "popup", minutes: 30 }] },
+        colorId: EVENT_COLORS[event.eventType] || "8",
+      },
+    });
+
+    console.log(`[${userId}] Calendar event updated: "${event.title}" (id: ${res.data.id})`);
+    return res.data.id;
+  } catch (err) {
+    console.error(`[${userId}] Calendar update failed:`, err.message);
+    return null;
+  }
+}
+
+async function deleteCalendarEvent(userId, calendarEventId) {
+  try {
+    const oauth2Client = await getOAuth2Client(userId);
+    if (!oauth2Client) return;
+
+    const calendar = google.calendar({ version: "v3", auth: oauth2Client });
+    await calendar.events.delete({ calendarId: "primary", eventId: calendarEventId });
+    console.log(`[${userId}] Calendar event deleted: ${calendarEventId}`);
+  } catch (err) {
+    console.error(`[${userId}] Calendar delete failed:`, err.message);
+  }
+}
+
 // ─── AI Parsing ─────────────────────────────────────────────────────
 
 async function parseWithAI(messages, groupName, currentMessageId) {
@@ -794,6 +929,7 @@ Messages:
 ${messagesText}
 
 Look for: school events, deadlines, items to bring, meetings, trips, payments, and any time-sensitive info.
+Also look for EVENT CHANGES: messages saying an event was moved, rescheduled, or cancelled.
 
 Rules:
 - Only extract items with clear dates/times
@@ -801,13 +937,16 @@ Rules:
 - For "bring X" items, set the event at the actual date/time mentioned (NOT the day before)
 - If year not mentioned, assume nearest future date
 - Confidence 0.0-1.0 reflects certainty
+- DATE CONFLICTS: If a message says "tomorrow on March 20th" but tomorrow is NOT March 20th, ALWAYS trust the explicit date (March 20th). The sender made a mistake with the relative date.
+- EVENT UPDATES: If a message says an event was moved/rescheduled (e.g. "the meeting on March 20th moved to March 21"), set isUpdate=true and include originalTitle and originalStartTime so the old event can be found and updated.
+- EVENT CANCELLATIONS: If a message says an event is cancelled, set isCancelled=true and include originalTitle and originalStartTime.
 
 IMPORTANT: Return ONLY valid JSON. No markdown, no code fences, no explanation. Just the raw JSON array.
 
 If no events found, return exactly: []
 
 Otherwise return:
-[{"title": "Short title", "description": "Context from message", "startTime": "ISO 8601", "endTime": "ISO 8601 or null", "location": "or null", "eventType": "SCHOOL_EVENT|DEADLINE|BRING_ITEM|MEETING|TRIP|PAYMENT|REMINDER|OTHER", "confidence": 0.9, "sourceMessageIndex": 0}]`,
+[{"title": "Short title", "description": "Context from message", "startTime": "ISO 8601", "endTime": "ISO 8601 or null", "location": "or null", "eventType": "SCHOOL_EVENT|DEADLINE|BRING_ITEM|MEETING|TRIP|PAYMENT|REMINDER|OTHER", "confidence": 0.9, "sourceMessageIndex": 0, "isUpdate": false, "originalTitle": null, "originalStartTime": null, "isCancelled": false}]`,
         },
       ],
     });
