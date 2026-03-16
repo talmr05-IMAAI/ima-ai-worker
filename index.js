@@ -6,7 +6,6 @@
  *
  * Deploy on Railway, Render, or any Node.js host.
  */
-
 const {
   default: makeWASocket,
   useMultiFileAuthState,
