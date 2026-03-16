@@ -497,6 +497,13 @@ async function handleIncomingMessage(userId, sock, msg) {
 
    // Debug: log message types
     console.log(`[${userId}] Message keys:`, Object.keys(msg.message || {}));
+  // Sender info (needed for both image and text handlers)
+    const senderJid = msg.key.participant || msg.key.remoteJid;
+    const senderPhone = senderJid.split("@")[0];
+    const senderName = msg.pushName || senderPhone;
+    const msgId = msg.key.id || `${Date.now()}-${Math.random()}`;
+    const msgTimestamp = new Date((msg.messageTimestamp || Date.now() / 1000) *
+  1000);
   // Handle image messages
     const imageMsg = msg.message?.imageMessage;
     if (imageMsg) {
