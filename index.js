@@ -501,9 +501,7 @@ async function handleIncomingMessage(userId, sock, msg) {
     const senderJid = msg.key.participant || msg.key.remoteJid;
     const senderPhone = senderJid.split("@")[0];
     const senderName = msg.pushName || senderPhone;
-    const msgId = msg.key.id || `${Date.now()}-${Math.random()}`;
-    const msgTimestamp = new Date((msg.messageTimestamp || Date.now() / 1000) *
-  1000);
+  
   // Handle image messages
     const imageMsg = msg.message?.imageMessage;
     if (imageMsg) {
@@ -572,10 +570,6 @@ async function handleIncomingMessage(userId, sock, msg) {
 
   console.log(`[${userId}] Queued message in "${dbGroup.name}": "${messageText.slice(0, 80)}"`);
 
-  // Get sender info
-  const senderJid = msg.key.participant || msg.key.remoteJid;
-  const senderPhone = senderJid.split("@")[0];
-  const senderName = msg.pushName || senderPhone;
 
   // Store message (unprocessed)
   const msgId = msg.key.id || `${Date.now()}-${Math.random()}`;
