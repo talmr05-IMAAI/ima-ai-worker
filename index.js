@@ -1,5 +1,5 @@
 /**
- * IMA AI WhatsApp Worker — Baileys Edition
+ * IMA AI WhatsApp Worker â Baileys Edition
  *
  * Uses @whiskeysockets/baileys (lightweight WebSocket-based WhatsApp client)
  * instead of whatsapp-web.js (which requires Chromium/Puppeteer).
@@ -33,16 +33,21 @@ const userTokens = new Map();
 // Quiet logger for Baileys (it's very verbose by default)
 const logger = pino({ level: "warn" });
 
-// ─── In-memory store for active WhatsApp sessions ───────────────────
+// âââ In-memory store for active WhatsApp sessions âââââââââââââââââââ
 
-/** @type {Map<string, { socket: any, qrCode: string | null, status: string }>} */
+/** @type {Map<string, { socket: any, qrCode: string | null, status: string, dbUserId: string, lastHeartbeat: number, reconnectAttempts: number }>} */
 const sessions = new Map();
 
-// Directory to persist auth credentials
+// Directory to persist auth credentials (PRESERVED across restarts for auto-reconnect)
 const AUTH_DIR = path.join(process.cwd(), ".wa-auth");
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-// ─── Express API ────────────────────────────────────────────────────
+// Reconnect settings
+const MAX_RECONNECT_ATTEMPTS = 10;
+const BASE_RECONNECT_DELAY_MS = 2000; // 2s, doubles each attempt (exponential backoff)
+const HEARTBEAT_INTERVAL_MS = 45000; // Check connection health every 45s
+
+// âââ Express API ââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 const app = express();
 app.use(express.json());
@@ -65,7 +70,7 @@ function authMiddleware(req, res, next) {
   next();
 }
 
-// ─── Baileys Session Management ─────────────────────────────────────
+// âââ Baileys Session Management âââââââââââââââââââââââââââââââââââââ
 
 async function startBaileysSession(userId, dbUserId) {
   dbUserId = dbUserId || userId;
@@ -74,7 +79,16 @@ async function startBaileysSession(userId, dbUserId) {
 
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-  const sessionData = { socket: null, qrCode: null, status: "initializing" };
+  // Preserve existing session data (reconnect attempts, etc.) or create new
+  const existingSession = sessions.get(userId);
+  const sessionData = {
+    socket: null,
+    qrCode: null,
+    status: "initializing",
+    dbUserId,
+    lastHeartbeat: Date.now(),
+    reconnectAttempts: existingSession?.reconnectAttempts || 0,
+  };
   sessions.set(userId, sessionData);
 
   const sock = makeWASocket({
@@ -88,6 +102,7 @@ async function startBaileysSession(userId, dbUserId) {
     // Reconnect settings
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: undefined,
+    keepAliveIntervalMs: 30000, // Baileys built-in keepalive ping every 30s
   });
 
   sessionData.socket = sock;
@@ -114,6 +129,8 @@ async function startBaileysSession(userId, dbUserId) {
       console.log(`[${userId}] WhatsApp connected!`);
       sessionData.status = "connected";
       sessionData.qrCode = null;
+      sessionData.reconnectAttempts = 0; // Reset on successful connection
+      sessionData.lastHeartbeat = Date.now();
 
       // Fetch groups and store in database (async, don't block status)
       // Delay slightly to let Baileys finish init queries
@@ -131,43 +148,41 @@ async function startBaileysSession(userId, dbUserId) {
       const statusCode =
         lastDisconnect?.error?.output?.statusCode;
 
-      // Treat 405, 401, 403, and loggedOut as "need fresh QR"
+      // Only these specific codes mean "session is invalid, need fresh QR"
       const needsFreshStart =
         statusCode === DisconnectReason.loggedOut ||
-        statusCode === 405 ||
-        statusCode === 401 ||
-        statusCode === 403;
+        statusCode === 405;
 
       console.log(
         `[${userId}] Connection closed. Status: ${statusCode}. NeedsFreshStart: ${needsFreshStart}`
       );
 
       if (needsFreshStart) {
-        // Clear bad credentials and stop — user must click Connect again
+        // Clear bad credentials and stop â user must click Connect again
         console.log(`[${userId}] Clearing credentials for fresh QR on next connect`);
         sessionData.status = "disconnected";
         sessions.delete(userId);
         fs.rmSync(authDir, { recursive: true, force: true });
-      } else if (statusCode !== undefined) {
-        // Temporary disconnect — reconnect (max 3 attempts)
+      } else {
+        // ANY other disconnect (including undefined statusCode) â auto-reconnect
         const attempts = sessionData.reconnectAttempts || 0;
-        if (attempts < 3) {
+        if (attempts < MAX_RECONNECT_ATTEMPTS) {
           sessionData.reconnectAttempts = attempts + 1;
           sessionData.status = "reconnecting";
-          console.log(`[${userId}] Reconnecting (attempt ${attempts + 1}/3)...`);
-          // Delay before reconnect to avoid hammering
-          await new Promise((r) => setTimeout(r, 2000));
-          await startBaileysSession(userId);
+          // Exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s max
+          const delay = Math.min(BASE_RECONNECT_DELAY_MS * Math.pow(2, attempts), 60000);
+          console.log(`[${userId}] Reconnecting (attempt ${attempts + 1}/${MAX_RECONNECT_ATTEMPTS}) in ${delay / 1000}s...`);
+          await new Promise((r) => setTimeout(r, delay));
+          try {
+            await startBaileysSession(userId, dbUserId);
+          } catch (reconnErr) {
+            console.error(`[${userId}] Reconnect failed:`, reconnErr.message);
+          }
         } else {
-          console.log(`[${userId}] Max reconnect attempts reached. Cleaning up.`);
+          console.log(`[${userId}] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Will retry on next heartbeat cycle.`);
           sessionData.status = "disconnected";
-          sessions.delete(userId);
-          fs.rmSync(authDir, { recursive: true, force: true });
+          // DON'T delete session or auth â heartbeat will try again later
         }
-      } else {
-        // Unknown disconnect — clean up
-        sessionData.status = "disconnected";
-        sessions.delete(userId);
       }
     }
   });
@@ -184,7 +199,7 @@ async function startBaileysSession(userId, dbUserId) {
       const jid = msg.key.remoteJid;
       const isGroup = jid?.endsWith("@g.us");
 
-      // Only process and log group messages — skip private chats entirely
+      // Only process and log group messages â skip private chats entirely
       if (!isGroup) continue;
 
       try {
@@ -198,7 +213,7 @@ async function startBaileysSession(userId, dbUserId) {
   return sessionData;
 }
 
-// ─── Group Sync ─────────────────────────────────────────────────────
+// âââ Group Sync âââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 async function syncGroups(userId, sock) {
   // Fetch all groups the user is part of
@@ -242,10 +257,10 @@ async function syncGroups(userId, sock) {
   console.log(`[${userId}] Synced ${synced}/${groupList.length} groups (${errors} errors)`);
 }
 
-// ─── API Endpoints ──────────────────────────────────────────────────
+// âââ API Endpoints ââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 /**
- * POST /sessions/:userId/start — Start a WhatsApp session
+ * POST /sessions/:userId/start â Start a WhatsApp session
  */
 app.post("/sessions/:userId/start", authMiddleware, async (req, res) => {
   const { userId } = req.params;
@@ -352,7 +367,7 @@ app.post("/sessions/:userId/start", authMiddleware, async (req, res) => {
 });
 
 /**
- * GET /sessions/:userId/status — Check session status
+ * GET /sessions/:userId/status â Check session status
  */
 app.get("/sessions/:userId/status", authMiddleware, (req, res) => {
   const { userId } = req.params;
@@ -371,7 +386,7 @@ app.get("/sessions/:userId/status", authMiddleware, (req, res) => {
 });
 
 /**
- * GET /sessions/:userId/groups — Get groups for connected user
+ * GET /sessions/:userId/groups â Get groups for connected user
  */
 app.get("/sessions/:userId/groups", authMiddleware, async (req, res) => {
   const { userId } = req.params;
@@ -395,7 +410,7 @@ app.get("/sessions/:userId/groups", authMiddleware, async (req, res) => {
 });
 
 /**
- * DELETE /sessions/:userId — Disconnect session
+ * DELETE /sessions/:userId â Disconnect session
  */
 app.delete("/sessions/:userId", authMiddleware, async (req, res) => {
   const { userId } = req.params;
@@ -412,19 +427,32 @@ app.delete("/sessions/:userId", authMiddleware, async (req, res) => {
 });
 
 /**
- * GET /health — Health check
+ * GET /health â Health check
  */
 app.get("/health", (req, res) => {
+  const sessionDetails = [];
+  for (const [userId, session] of sessions) {
+    sessionDetails.push({
+      userId,
+      status: session.status,
+      reconnectAttempts: session.reconnectAttempts,
+      lastHeartbeat: session.lastHeartbeat ? new Date(session.lastHeartbeat).toISOString() : null,
+      secondsSinceHeartbeat: session.lastHeartbeat ? Math.round((Date.now() - session.lastHeartbeat) / 1000) : null,
+    });
+  }
   res.json({
     status: "ok",
     activeSessions: sessions.size,
     uptime: process.uptime(),
     engine: "baileys",
+    heartbeatIntervalSec: HEARTBEAT_INTERVAL_MS / 1000,
+    maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
+    sessions: sessionDetails,
   });
 });
 
 /**
- * GET /debug-db/:userId — Check if user exists and try to create
+ * GET /debug-db/:userId â Check if user exists and try to create
  */
 app.get("/debug-db/:userId", async (req, res) => {
   const { userId } = req.params;
@@ -468,7 +496,7 @@ app.get("/debug-db/:userId", async (req, res) => {
   res.json(results);
 });
 
-// ─── Message Processing (Batched) ────────────────────────────────────
+// âââ Message Processing (Batched) ââââââââââââââââââââââââââââââââââââ
 
 // Track which groups have pending unprocessed messages
 const pendingGroups = new Set();
@@ -496,11 +524,13 @@ async function handleIncomingMessage(userId, sock, msg) {
 
    // Debug: log message types
     console.log(`[${userId}] Message keys:`, Object.keys(msg.message || {}));
-  // Sender info (needed for both image and text handlers)
+  // Common fields needed for both image and text handlers
     const senderJid = msg.key.participant || msg.key.remoteJid;
     const senderPhone = senderJid.split("@")[0];
     const senderName = msg.pushName || senderPhone;
-  
+    const msgId = msg.key.id || `${Date.now()}-${Math.random()}`;
+    const msgTimestamp = new Date((msg.messageTimestamp || Date.now() / 1000) * 1000);
+
   // Handle image messages
     const imageMsg = msg.message?.imageMessage;
     if (imageMsg) {
@@ -571,7 +601,6 @@ async function handleIncomingMessage(userId, sock, msg) {
 
 
   // Store message (unprocessed)
-  const msgId = msg.key.id || `${Date.now()}-${Math.random()}`;
   await prisma.whatsAppMessage.upsert({
     where: { waMessageId: msgId },
     update: {},
@@ -581,7 +610,7 @@ async function handleIncomingMessage(userId, sock, msg) {
       senderPhone,
       senderName,
       content: messageText,
-      timestamp: new Date((msg.messageTimestamp || Date.now() / 1000) * 1000),
+      timestamp: msgTimestamp,
     },
   });
 
@@ -685,11 +714,11 @@ async function processGroupBatch(groupId) {
 setInterval(processPendingGroups, BATCH_INTERVAL_MS);
 console.log(`Batch processing enabled: every ${BATCH_INTERVAL_MS / 1000}s`);
 
-// ─── Google Calendar Auto-Invite ─────────────────────────────────────
+// âââ Google Calendar Auto-Invite âââââââââââââââââââââââââââââââââââââ
 
 const EVENT_EMOJIS = {
-  SCHOOL_EVENT: "🏫", DEADLINE: "⏰", BRING_ITEM: "🎒", MEETING: "🤝",
-  TRIP: "🚌", PAYMENT: "💰", REMINDER: "📌", OTHER: "📋",
+  SCHOOL_EVENT: "ð«", DEADLINE: "â°", BRING_ITEM: "ð", MEETING: "ð¤",
+  TRIP: "ð", PAYMENT: "ð°", REMINDER: "ð", OTHER: "ð",
 };
 
 const EVENT_COLORS = {
@@ -740,7 +769,7 @@ async function sendCalendarInvite(userId, event, groupName) {
   console.log(`[${userId}] Sending calendar invite: "${event.title}" (email: ${tokens.email || "NONE"}, hasRefresh: ${!!tokens.refreshToken})`);
 
   try {
-    // DO NOT pass redirect URI — it's not needed for token refresh and causes invalid_request errors
+    // DO NOT pass redirect URI â it's not needed for token refresh and causes invalid_request errors
     const oauth2Client = new google.auth.OAuth2(
       process.env.GOOGLE_CLIENT_ID,
       process.env.GOOGLE_CLIENT_SECRET
@@ -778,7 +807,7 @@ async function sendCalendarInvite(userId, event, groupName) {
 
     const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 
-    const emoji = EVENT_EMOJIS[event.eventType] || "📋";
+    const emoji = EVENT_EMOJIS[event.eventType] || "ð";
     const endTime = event.endTime
       ? new Date(event.endTime)
       : new Date(new Date(event.startTime).getTime() + 60 * 60 * 1000);
@@ -790,8 +819,8 @@ async function sendCalendarInvite(userId, event, groupName) {
         description: [
           event.description || "",
           "",
-          `📱 Detected by IMA AI from "${groupName}"`,
-          `🎯 Confidence: ${Math.round(event.confidence * 100)}%`,
+          `ð± Detected by IMA AI from "${groupName}"`,
+          `ð¯ Confidence: ${Math.round(event.confidence * 100)}%`,
         ].join("\n"),
         start: {
           dateTime: new Date(event.startTime).toISOString(),
@@ -802,7 +831,7 @@ async function sendCalendarInvite(userId, event, groupName) {
           timeZone: "Asia/Jerusalem",
         },
         location: event.location || undefined,
-        // No attendees — event is created directly on user's primary calendar
+        // No attendees â event is created directly on user's primary calendar
         // and will sync naturally to Apple Calendar, Outlook, etc.
         reminders: {
           useDefault: false,
@@ -826,7 +855,7 @@ async function sendCalendarInvite(userId, event, groupName) {
   }
 }
 
-// ─── AI Parsing ─────────────────────────────────────────────────────
+// âââ AI Parsing âââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
   async function parseImageWithAI(imageBuffer, mimeType, caption, groupName) {
     const base64 = imageBuffer.toString("base64");
@@ -995,24 +1024,121 @@ Otherwise return:
   }
 }
 
-// ─── Start ──────────────────────────────────────────────────────────
+// âââ Heartbeat â detect silent disconnects & auto-restore ââââââââââââ
+
+async function heartbeat() {
+  for (const [userId, session] of sessions) {
+    // Skip sessions that are actively connecting or showing QR
+    if (session.status === "initializing" || session.status === "qr_ready" || session.status === "reconnecting") {
+      continue;
+    }
+
+    if (session.status === "connected") {
+      // Check if socket is still alive by reading connection state
+      try {
+        const state = session.socket?.ws?.readyState;
+        // WebSocket.OPEN = 1
+        if (state !== 1 && state !== undefined) {
+          console.log(`[${userId}] Heartbeat: WebSocket not OPEN (state=${state}), triggering reconnect`);
+          session.status = "reconnecting";
+          session.reconnectAttempts = 0;
+          await startBaileysSession(userId, session.dbUserId);
+        } else {
+          session.lastHeartbeat = Date.now();
+        }
+      } catch (err) {
+        console.error(`[${userId}] Heartbeat check failed:`, err.message);
+      }
+    }
+
+    if (session.status === "disconnected") {
+      // Session died and exhausted reconnect attempts â try again
+      console.log(`[${userId}] Heartbeat: session is disconnected, attempting recovery...`);
+      session.reconnectAttempts = 0;
+      try {
+        await startBaileysSession(userId, session.dbUserId);
+      } catch (err) {
+        console.error(`[${userId}] Heartbeat recovery failed:`, err.message);
+      }
+    }
+  }
+}
+
+// Auto-restore sessions from saved auth credentials on startup
+async function autoRestoreSessions() {
+  if (!fs.existsSync(AUTH_DIR)) return;
+
+  const authDirs = fs.readdirSync(AUTH_DIR).filter((d) => {
+    const fullPath = path.join(AUTH_DIR, d);
+    return fs.statSync(fullPath).isDirectory() && fs.existsSync(path.join(fullPath, "creds.json"));
+  });
+
+  if (authDirs.length === 0) {
+    console.log("[AutoRestore] No saved sessions to restore");
+    return;
+  }
+
+  console.log(`[AutoRestore] Found ${authDirs.length} saved session(s), restoring...`);
+
+  for (const userId of authDirs) {
+    try {
+      // Look up the dbUserId from the database
+      const memberships = await prisma.groupMembership.findMany({
+        where: { isActive: true },
+        select: { userId: true },
+        distinct: ["userId"],
+      });
+
+      // The userId in the auth dir might be the session userId or dbUserId
+      // Try to find matching user
+      let dbUserId = userId;
+
+      // Try to look up user by checking CalendarLink or just use userId
+      try {
+        const calLink = await prisma.calendarLink.findFirst({
+          where: { isActive: true },
+          select: { userId: true },
+        });
+        if (calLink) {
+          dbUserId = calLink.userId;
+        }
+      } catch (e) {}
+
+      console.log(`[AutoRestore] Restoring session for ${userId} (dbUserId: ${dbUserId})`);
+      await startBaileysSession(userId, dbUserId);
+    } catch (err) {
+      console.error(`[AutoRestore] Failed to restore session ${userId}:`, err.message);
+    }
+  }
+}
+
+// âââ Start ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 const PORT = process.env.PORT || 3001;
 
-// Clean up any stale auth files on startup
-if (fs.existsSync(AUTH_DIR)) {
-  fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-  fs.mkdirSync(AUTH_DIR, { recursive: true });
-  console.log("Cleared stale auth files on startup");
-}
+// DO NOT wipe auth on startup â we need it for auto-reconnect!
+// Auth credentials are preserved so sessions survive Railway redeploys.
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`IMA AI Worker v3.0 running on port ${PORT}`);
-  console.log(`Engine: Baileys | Auto-calendar: enabled`);
+app.listen(PORT, "0.0.0.0", async () => {
+  console.log(`IMA AI Worker v4.0 running on port ${PORT}`);
+  console.log(`Engine: Baileys | Auto-calendar: enabled | Heartbeat: ${HEARTBEAT_INTERVAL_MS / 1000}s`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
+
+  // Auto-restore saved sessions after a short delay (let Express settle)
+  setTimeout(async () => {
+    try {
+      await autoRestoreSessions();
+    } catch (err) {
+      console.error("[AutoRestore] Error:", err.message);
+    }
+  }, 3000);
 });
 
-// Keep process alive — catch unhandled errors
+// Start heartbeat monitor
+setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
+console.log(`Heartbeat monitor enabled: every ${HEARTBEAT_INTERVAL_MS / 1000}s`);
+
+// Keep process alive â catch unhandled errors
 process.on("uncaughtException", (err) => {
   console.error("Uncaught exception (keeping alive):", err.message);
 });
