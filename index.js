@@ -1,5 +1,5 @@
 /**
- * IMA AI WhatsApp Worker â Baileys Edition
+ * IMA AI WhatsApp Worker — Baileys Edition
  *
  * Uses @whiskeysockets/baileys (lightweight WebSocket-based WhatsApp client)
  * instead of whatsapp-web.js (which requires Chromium/Puppeteer).
@@ -33,7 +33,7 @@ const userTokens = new Map();
 // Quiet logger for Baileys (it's very verbose by default)
 const logger = pino({ level: "warn" });
 
-// âââ In-memory store for active WhatsApp sessions âââââââââââââââââââ
+// ─── In-memory store for active WhatsApp sessions ───────────────────
 
 /** @type {Map<string, { socket: any, qrCode: string | null, status: string, dbUserId: string, lastHeartbeat: number, reconnectAttempts: number }>} */
 const sessions = new Map();
@@ -47,7 +47,7 @@ const MAX_RECONNECT_ATTEMPTS = 10;
 const BASE_RECONNECT_DELAY_MS = 2000; // 2s, doubles each attempt (exponential backoff)
 const HEARTBEAT_INTERVAL_MS = 45000; // Check connection health every 45s
 
-// âââ Express API ââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ─── Express API ────────────────────────────────────────────────────
 
 const app = express();
 app.use(express.json());
@@ -70,7 +70,7 @@ function authMiddleware(req, res, next) {
   next();
 }
 
-// âââ Baileys Session Management âââââââââââââââââââââââââââââââââââââ
+// ─── Baileys Session Management ─────────────────────────────────────
 
 async function startBaileysSession(userId, dbUserId) {
   dbUserId = dbUserId || userId;
@@ -158,13 +158,13 @@ async function startBaileysSession(userId, dbUserId) {
       );
 
       if (needsFreshStart) {
-        // Clear bad credentials and stop â user must click Connect again
+        // Clear bad credentials and stop — user must click Connect again
         console.log(`[${userId}] Clearing credentials for fresh QR on next connect`);
         sessionData.status = "disconnected";
         sessions.delete(userId);
         fs.rmSync(authDir, { recursive: true, force: true });
       } else {
-        // ANY other disconnect (including undefined statusCode) â auto-reconnect
+        // ANY other disconnect (including undefined statusCode) — auto-reconnect
         const attempts = sessionData.reconnectAttempts || 0;
         if (attempts < MAX_RECONNECT_ATTEMPTS) {
           sessionData.reconnectAttempts = attempts + 1;
@@ -181,7 +181,7 @@ async function startBaileysSession(userId, dbUserId) {
         } else {
           console.log(`[${userId}] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Will retry on next heartbeat cycle.`);
           sessionData.status = "disconnected";
-          // DON'T delete session or auth â heartbeat will try again later
+          // DON'T delete session or auth — heartbeat will try again later
         }
       }
     }
@@ -199,7 +199,7 @@ async function startBaileysSession(userId, dbUserId) {
       const jid = msg.key.remoteJid;
       const isGroup = jid?.endsWith("@g.us");
 
-      // Only process and log group messages â skip private chats entirely
+      // Only process and log group messages — skip private chats entirely
       if (!isGroup) continue;
 
       try {
@@ -213,7 +213,7 @@ async function startBaileysSession(userId, dbUserId) {
   return sessionData;
 }
 
-// âââ Group Sync âââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ─── Group Sync ─────────────────────────────────────────────────────
 
 async function syncGroups(userId, sock) {
   // Fetch all groups the user is part of
@@ -257,10 +257,10 @@ async function syncGroups(userId, sock) {
   console.log(`[${userId}] Synced ${synced}/${groupList.length} groups (${errors} errors)`);
 }
 
-// âââ API Endpoints ââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ─── API Endpoints ──────────────────────────────────────────────────
 
 /**
- * POST /sessions/:userId/start â Start a WhatsApp session
+ * POST /sessions/:userId/start — Start a WhatsApp session
  */
 app.post("/sessions/:userId/start", authMiddleware, async (req, res) => {
   const { userId } = req.params;
@@ -367,7 +367,7 @@ app.post("/sessions/:userId/start", authMiddleware, async (req, res) => {
 });
 
 /**
- * GET /sessions/:userId/status â Check session status
+ * GET /sessions/:userId/status — Check session status
  */
 app.get("/sessions/:userId/status", authMiddleware, (req, res) => {
   const { userId } = req.params;
@@ -386,7 +386,7 @@ app.get("/sessions/:userId/status", authMiddleware, (req, res) => {
 });
 
 /**
- * GET /sessions/:userId/groups â Get groups for connected user
+ * GET /sessions/:userId/groups — Get groups for connected user
  */
 app.get("/sessions/:userId/groups", authMiddleware, async (req, res) => {
   const { userId } = req.params;
@@ -410,7 +410,7 @@ app.get("/sessions/:userId/groups", authMiddleware, async (req, res) => {
 });
 
 /**
- * DELETE /sessions/:userId â Disconnect session
+ * DELETE /sessions/:userId — Disconnect session
  */
 app.delete("/sessions/:userId", authMiddleware, async (req, res) => {
   const { userId } = req.params;
@@ -427,7 +427,7 @@ app.delete("/sessions/:userId", authMiddleware, async (req, res) => {
 });
 
 /**
- * GET /health â Health check
+ * GET /health — Health check
  */
 app.get("/health", (req, res) => {
   const sessionDetails = [];
@@ -452,7 +452,7 @@ app.get("/health", (req, res) => {
 });
 
 /**
- * GET /debug-db/:userId â Check if user exists and try to create
+ * GET /debug-db/:userId — Check if user exists and try to create
  */
 app.get("/debug-db/:userId", async (req, res) => {
   const { userId } = req.params;
@@ -496,7 +496,7 @@ app.get("/debug-db/:userId", async (req, res) => {
   res.json(results);
 });
 
-// âââ Message Processing (Batched) ââââââââââââââââââââââââââââââââââââ
+// ─── Message Processing (Batched) ────────────────────────────────────
 
 // Track which groups have pending unprocessed messages
 const pendingGroups = new Set();
@@ -714,11 +714,11 @@ async function processGroupBatch(groupId) {
 setInterval(processPendingGroups, BATCH_INTERVAL_MS);
 console.log(`Batch processing enabled: every ${BATCH_INTERVAL_MS / 1000}s`);
 
-// âââ Google Calendar Auto-Invite âââââââââââââââââââââââââââââââââââââ
+// ─── Google Calendar Auto-Invite ─────────────────────────────────────
 
 const EVENT_EMOJIS = {
-  SCHOOL_EVENT: "ð«", DEADLINE: "â°", BRING_ITEM: "ð", MEETING: "ð¤",
-  TRIP: "ð", PAYMENT: "ð°", REMINDER: "ð", OTHER: "ð",
+  SCHOOL_EVENT: "🏫", DEADLINE: "⏰", BRING_ITEM: "🎒", MEETING: "🤝",
+  TRIP: "🚌", PAYMENT: "💰", REMINDER: "📌", OTHER: "📋",
 };
 
 const EVENT_COLORS = {
@@ -769,7 +769,7 @@ async function sendCalendarInvite(userId, event, groupName) {
   console.log(`[${userId}] Sending calendar invite: "${event.title}" (email: ${tokens.email || "NONE"}, hasRefresh: ${!!tokens.refreshToken})`);
 
   try {
-    // DO NOT pass redirect URI â it's not needed for token refresh and causes invalid_request errors
+    // DO NOT pass redirect URI — it's not needed for token refresh and causes invalid_request errors
     const oauth2Client = new google.auth.OAuth2(
       process.env.GOOGLE_CLIENT_ID,
       process.env.GOOGLE_CLIENT_SECRET
@@ -807,7 +807,7 @@ async function sendCalendarInvite(userId, event, groupName) {
 
     const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 
-    const emoji = EVENT_EMOJIS[event.eventType] || "ð";
+    const emoji = EVENT_EMOJIS[event.eventType] || "📋";
     const endTime = event.endTime
       ? new Date(event.endTime)
       : new Date(new Date(event.startTime).getTime() + 60 * 60 * 1000);
@@ -819,8 +819,8 @@ async function sendCalendarInvite(userId, event, groupName) {
         description: [
           event.description || "",
           "",
-          `ð± Detected by IMA AI from "${groupName}"`,
-          `ð¯ Confidence: ${Math.round(event.confidence * 100)}%`,
+          `📱 Detected by IMA AI from "${groupName}"`,
+          `🎯 Confidence: ${Math.round(event.confidence * 100)}%`,
         ].join("\n"),
         start: {
           dateTime: new Date(event.startTime).toISOString(),
@@ -831,7 +831,7 @@ async function sendCalendarInvite(userId, event, groupName) {
           timeZone: "Asia/Jerusalem",
         },
         location: event.location || undefined,
-        // No attendees â event is created directly on user's primary calendar
+        // No attendees — event is created directly on user's primary calendar
         // and will sync naturally to Apple Calendar, Outlook, etc.
         reminders: {
           useDefault: false,
@@ -855,7 +855,7 @@ async function sendCalendarInvite(userId, event, groupName) {
   }
 }
 
-// âââ AI Parsing âââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ─── AI Parsing ─────────────────────────────────────────────────────
 
   async function parseImageWithAI(imageBuffer, mimeType, caption, groupName) {
     const base64 = imageBuffer.toString("base64");
@@ -1024,7 +1024,7 @@ Otherwise return:
   }
 }
 
-// âââ Heartbeat â detect silent disconnects & auto-restore ââââââââââââ
+// ─── Heartbeat — detect silent disconnects & auto-restore ────────────
 
 async function heartbeat() {
   for (const [userId, session] of sessions) {
@@ -1052,7 +1052,7 @@ async function heartbeat() {
     }
 
     if (session.status === "disconnected") {
-      // Session died and exhausted reconnect attempts â try again
+      // Session died and exhausted reconnect attempts — try again
       console.log(`[${userId}] Heartbeat: session is disconnected, attempting recovery...`);
       session.reconnectAttempts = 0;
       try {
@@ -1112,11 +1112,11 @@ async function autoRestoreSessions() {
   }
 }
 
-// âââ Start ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ─── Start ──────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3001;
 
-// DO NOT wipe auth on startup â we need it for auto-reconnect!
+// DO NOT wipe auth on startup — we need it for auto-reconnect!
 // Auth credentials are preserved so sessions survive Railway redeploys.
 
 app.listen(PORT, "0.0.0.0", async () => {
@@ -1138,7 +1138,7 @@ app.listen(PORT, "0.0.0.0", async () => {
 setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
 console.log(`Heartbeat monitor enabled: every ${HEARTBEAT_INTERVAL_MS / 1000}s`);
 
-// Keep process alive â catch unhandled errors
+// Keep process alive — catch unhandled errors
 process.on("uncaughtException", (err) => {
   console.error("Uncaught exception (keeping alive):", err.message);
 });
